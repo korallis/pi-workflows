@@ -26,8 +26,12 @@ import { Type } from "@sinclair/typebox";
 import { Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { spawn } from "child_process";
 import { readFileSync, existsSync, readdirSync, mkdirSync, unlinkSync } from "fs";
+import { homedir } from "os";
 import { join, resolve } from "path";
 import { applyExtensionDefaults } from "./themeMap.ts";
+
+// Global fallback home — lets agents/chains resolve from any directory
+const GLOBAL_AGENTS_DIR = join(homedir(), ".pi", "agent", "agents");
 
 // ── Types ────────────────────────────────────────
 
@@ -164,6 +168,7 @@ function scanAgentDirs(cwd: string): Map<string, AgentDef> {
 		join(cwd, "agents"),
 		join(cwd, ".claude", "agents"),
 		join(cwd, ".pi", "agents"),
+		GLOBAL_AGENTS_DIR,
 	];
 
 	const agents = new Map<string, AgentDef>();
@@ -213,7 +218,8 @@ export default function (pi: ExtensionAPI) {
 			agentSessions.set(key, existsSync(sessionFile) ? sessionFile : null);
 		}
 
-		const chainPath = join(cwd, ".pi", "agents", "agent-chain.yaml");
+		const localChainPath = join(cwd, ".pi", "agents", "agent-chain.yaml");
+		const chainPath = existsSync(localChainPath) ? localChainPath : join(GLOBAL_AGENTS_DIR, "agent-chain.yaml");
 		if (existsSync(chainPath)) {
 			try {
 				chains = parseChainYaml(readFileSync(chainPath, "utf-8"));
@@ -346,6 +352,7 @@ export default function (pi: ExtensionAPI) {
 			"--mode", "json",
 			"-p",
 			"--no-extensions",
+			"-e", "npm:claude-agent-sdk-pi",
 			"--model", model,
 			"--tools", agentDef.tools,
 			"--thinking", "off",

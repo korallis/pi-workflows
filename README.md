@@ -26,7 +26,7 @@ All three are required:
 
 ## API Keys
 
-Pi does **not** auto-load `.env` files — API keys must be present in your shell's environment **before** you launch Pi. A sample file is provided:
+Model provider API keys are **not required** — PI is authenticated to all model providers via subscription, so agent-team / agent-chain model routing works with no `.env` keys. The variables below are optional, only for providers you want to override with your own key. A sample file is provided:
 
 ```bash
 cp .env.sample .env   # copy the template
@@ -405,3 +405,14 @@ Released under the [MIT License](LICENSE) — fork it, ship it, use it however h
 Learn tactical agentic coding patterns with [Tactical Agentic Coding](https://agenticengineer.com/tactical-agentic-coding?y=pivscc)
 
 Follow the [IndyDevDan YouTube channel](https://www.youtube.com/@indydevdan) to improve your agentic coding advantage.
+
+---
+
+## Agent team model routing
+
+Agents in `.pi/agents/*.md` declare a `models:` codename list in their frontmatter
+(e.g. `models: reason, sol`). Codenames resolve via `.pi/agents/models.yaml`, which
+maps each codename to a `provider/id` string (e.g. `claude-agent-sdk/claude-fable-5:high`).
+Agents with multiple codenames fan out across those models in parallel to cross-check
+results. To re-point any role, edit its line in `models.yaml` — no agent files need to
+change. No API keys or .env are required — PI is authenticated to all providers via subscription.

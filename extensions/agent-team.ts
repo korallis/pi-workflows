@@ -22,8 +22,12 @@ import { Type } from "@sinclair/typebox";
 import { Text, type AutocompleteItem, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { spawn } from "child_process";
 import { readdirSync, readFileSync, existsSync, mkdirSync, unlinkSync } from "fs";
+import { homedir } from "os";
 import { join, resolve } from "path";
 import { applyExtensionDefaults } from "./themeMap.ts";
+
+// Global fallback home — lets agents/teams resolve from any directory
+const GLOBAL_AGENTS_DIR = join(homedir(), ".pi", "agent", "agents");
 
 // ── Types ────────────────────────────────────────
 
@@ -31,6 +35,7 @@ interface AgentDef {
 	name: string;
 	description: string;
 	tools: string;
+	models: string[];
 	systemPrompt: string;
 	file: string;
 }
@@ -74,6 +79,33 @@ function parseTeamsYaml(raw: string): Record<string, string[]> {
 	return teams;
 }
 
+// ── Models YAML Parser ───────────────────────────
+
+function parseModelsYaml(raw: string): Record<string, string> {
+	const map: Record<string, string> = {};
+	let inModels = false;
+	for (const rawLine of raw.split("\n")) {
+		const line = rawLine.replace(/#.*$/, "");
+		if (!line.trim()) continue;
+		if (/^models:\s*$/.test(line)) {
+			inModels = true;
+			continue;
+		}
+		// A non-indented, non-comment line ends the models block
+		if (!/^\s/.test(line)) {
+			inModels = false;
+			continue;
+		}
+		if (!inModels) continue;
+		const idx = line.indexOf(":");
+		if (idx <= 0) continue;
+		const codename = line.slice(0, idx).trim();
+		const spec = line.slice(idx + 1).trim();
+		if (codename && spec) map[codename] = spec;
+	}
+	return map;
+}
+
 // ── Frontmatter Parser ───────────────────────────
 
 function parseAgentFile(filePath: string): AgentDef | null {
@@ -92,10 +124,16 @@ function parseAgentFile(filePath: string): AgentDef | null {
 
 		if (!frontmatter.name) return null;
 
+		const models = (frontmatter.models || "")
+			.split(",")
+			.map(m => m.trim())
+			.filter(Boolean);
+
 		return {
 			name: frontmatter.name,
 			description: frontmatter.description || "",
 			tools: frontmatter.tools || "read,grep,find,ls",
+			models,
 			systemPrompt: match[2].trim(),
 			file: filePath,
 		};
@@ -109,6 +147,7 @@ function scanAgentDirs(cwd: string): AgentDef[] {
 		join(cwd, "agents"),
 		join(cwd, ".claude", "agents"),
 		join(cwd, ".pi", "agents"),
+		GLOBAL_AGENTS_DIR,
 	];
 
 	const agents: AgentDef[] = [];
@@ -138,6 +177,7 @@ export default function (pi: ExtensionAPI) {
 	const agentStates: Map<string, AgentState> = new Map();
 	let allAgentDefs: AgentDef[] = [];
 	let teams: Record<string, string[]> = {};
+	let modelMap: Record<string, string> = {};
 	let activeTeamName = "";
 	let gridCols = 2;
 	let widgetCtx: any;
@@ -154,8 +194,9 @@ export default function (pi: ExtensionAPI) {
 		// Load all agent definitions
 		allAgentDefs = scanAgentDirs(cwd);
 
-		// Load teams from .pi/agents/teams.yaml
-		const teamsPath = join(cwd, ".pi", "agents", "teams.yaml");
+		// Load teams from .pi/agents/teams.yaml, falling back to the global home
+		const localTeamsPath = join(cwd, ".pi", "agents", "teams.yaml");
+		const teamsPath = existsSync(localTeamsPath) ? localTeamsPath : join(GLOBAL_AGENTS_DIR, "teams.yaml");
 		if (existsSync(teamsPath)) {
 			try {
 				teams = parseTeamsYaml(readFileSync(teamsPath, "utf-8"));
@@ -170,6 +211,19 @@ export default function (pi: ExtensionAPI) {
 		if (Object.keys(teams).length === 0) {
 			teams = { all: allAgentDefs.map(d => d.name) };
 		}
+
+		// Load codename→spec routing from .pi/agents/models.yaml (same fallback as teams)
+		const localModelsPath = join(cwd, ".pi", "agents", "models.yaml");
+		const modelsPath = existsSync(localModelsPath) ? localModelsPath : join(GLOBAL_AGENTS_DIR, "models.yaml");
+		if (existsSync(modelsPath)) {
+			try {
+				modelMap = parseModelsYaml(readFileSync(modelsPath, "utf-8"));
+			} catch {
+				modelMap = {};
+			}
+		} else {
+			modelMap = {};
+		}
 	}
 
 	function activateTeam(teamName: string) {
@@ -183,7 +237,7 @@ export default function (pi: ExtensionAPI) {
 			if (!def) continue;
 			const key = def.name.toLowerCase().replace(/\s+/g, "-");
 			const sessionFile = join(sessionDir, `${key}.json`);
-			agentStates.set(def.name.toLowerCase(), {
+			agentStates.set(key, {
 				def,
 				status: "idle",
 				task: "",
@@ -298,12 +352,12 @@ export default function (pi: ExtensionAPI) {
 
 	// ── Dispatch Agent (returns Promise) ─────────
 
-	function dispatchAgent(
+	async function dispatchAgent(
 		agentName: string,
 		task: string,
 		ctx: any,
 	): Promise<{ output: string; exitCode: number; elapsed: number }> {
-		const key = agentName.toLowerCase();
+		const key = agentName.toLowerCase().replace(/\s+/g, "-");
 		const state = agentStates.get(key);
 		if (!state) {
 			return Promise.resolve({
@@ -335,133 +389,175 @@ export default function (pi: ExtensionAPI) {
 			updateWidget();
 		}, 1000);
 
-		const model = ctx.model
+		const defaultModel = ctx.model
 			? `${ctx.model.provider}/${ctx.model.id}`
 			: "openrouter/google/gemini-3-flash-preview";
 
-		// Session file for this agent
 		const agentKey = state.def.name.toLowerCase().replace(/\s+/g, "-");
-		const agentSessionFile = join(sessionDir, `${agentKey}.json`);
 
-		// Build args — first run creates session, subsequent runs resume
-		const args = [
-			"--mode", "json",
-			"-p",
-			"--no-extensions",
-			"--model", model,
-			"--tools", state.def.tools,
-			"--thinking", "off",
-			"--append-system-prompt", state.def.systemPrompt,
-			"--session", agentSessionFile,
-		];
-
-		// Continue existing session if we have one
-		if (state.sessionFile) {
-			args.push("-c");
+		// Resolve fan-out targets from the agent's models: codenames.
+		// No codenames → single default-model dispatch (back-compat).
+		const unresolved: string[] = [];
+		let targets: { label: string; spec: string; sessionFile: string }[];
+		if (state.def.models.length === 0) {
+			targets = [{ label: "default", spec: defaultModel, sessionFile: join(sessionDir, `${agentKey}.json`) }];
+		} else {
+			targets = [];
+			for (const codename of state.def.models) {
+				const spec = modelMap[codename];
+				if (!spec) {
+					unresolved.push(codename);
+					continue;
+				}
+				targets.push({
+					label: codename,
+					spec,
+					sessionFile: join(sessionDir, `${agentKey}__${codename}.json`),
+				});
+			}
 		}
 
-		args.push(task);
+		// Every codename was unknown → fail clearly rather than silently.
+		if (targets.length === 0) {
+			clearInterval(state.timer);
+			state.status = "error";
+			state.elapsed = Date.now() - startTime;
+			state.lastWork = `Unknown model codenames: ${unresolved.join(", ")}`;
+			updateWidget();
+			return {
+				output: `Agent "${displayName(state.def.name)}" has no resolvable models. Unknown codenames: ${unresolved.join(", ")}. Check .pi/agents/models.yaml.`,
+				exitCode: 1,
+				elapsed: state.elapsed,
+			};
+		}
 
-		const textChunks: string[] = [];
+		// Spawn one Pi subprocess for a single resolved (spec, sessionFile) target.
+		const runOne = (spec: string, sessionFile: string): Promise<{ output: string; exitCode: number }> => {
+			const resumeExisting = existsSync(sessionFile);
+			const args = [
+				"--mode", "json",
+				"-p",
+				"--no-extensions",
+				"-e", "npm:claude-agent-sdk-pi",
+				"--model", spec,
+				"--tools", state.def.tools,
+				"--thinking", "off",
+				"--append-system-prompt", state.def.systemPrompt,
+				"--session", sessionFile,
+			];
+			if (resumeExisting) args.push("-c");
+			args.push(task);
 
-		return new Promise((resolve) => {
-			const proc = spawn("pi", args, {
-				stdio: ["ignore", "pipe", "pipe"],
-				env: { ...process.env },
-			});
+			const textChunks: string[] = [];
 
-			let buffer = "";
+			return new Promise((resolveOne) => {
+				const proc = spawn("pi", args, {
+					stdio: ["ignore", "pipe", "pipe"],
+					env: { ...process.env },
+				});
 
-			proc.stdout!.setEncoding("utf-8");
-			proc.stdout!.on("data", (chunk: string) => {
-				buffer += chunk;
-				const lines = buffer.split("\n");
-				buffer = lines.pop() || "";
-				for (const line of lines) {
-					if (!line.trim()) continue;
-					try {
-						const event = JSON.parse(line);
-						if (event.type === "message_update") {
-							const delta = event.assistantMessageEvent;
-							if (delta?.type === "text_delta") {
-								textChunks.push(delta.delta || "");
-								const full = textChunks.join("");
-								const last = full.split("\n").filter((l: string) => l.trim()).pop() || "";
-								state.lastWork = last;
+				let buffer = "";
+
+				proc.stdout!.setEncoding("utf-8");
+				proc.stdout!.on("data", (chunk: string) => {
+					buffer += chunk;
+					const lines = buffer.split("\n");
+					buffer = lines.pop() || "";
+					for (const line of lines) {
+						if (!line.trim()) continue;
+						try {
+							const event = JSON.parse(line);
+							if (event.type === "message_update") {
+								const delta = event.assistantMessageEvent;
+								if (delta?.type === "text_delta") {
+									textChunks.push(delta.delta || "");
+									const full = textChunks.join("");
+									const last = full.split("\n").filter((l: string) => l.trim()).pop() || "";
+									state.lastWork = last;
+									updateWidget();
+								}
+							} else if (event.type === "tool_execution_start") {
+								state.toolCount++;
 								updateWidget();
+							} else if (event.type === "message_end") {
+								const msg = event.message;
+								if (msg?.usage && contextWindow > 0) {
+									state.contextPct = ((msg.usage.input || 0) / contextWindow) * 100;
+									updateWidget();
+								}
+							} else if (event.type === "agent_end") {
+								const msgs = event.messages || [];
+								const last = [...msgs].reverse().find((m: any) => m.role === "assistant");
+								if (last?.usage && contextWindow > 0) {
+									state.contextPct = ((last.usage.input || 0) / contextWindow) * 100;
+									updateWidget();
+								}
 							}
-						} else if (event.type === "tool_execution_start") {
-							state.toolCount++;
-							updateWidget();
-						} else if (event.type === "message_end") {
-							const msg = event.message;
-							if (msg?.usage && contextWindow > 0) {
-								state.contextPct = ((msg.usage.input || 0) / contextWindow) * 100;
-								updateWidget();
+						} catch {}
+					}
+				});
+
+				proc.stderr!.setEncoding("utf-8");
+				proc.stderr!.on("data", () => {});
+
+				proc.on("close", (code) => {
+					if (buffer.trim()) {
+						try {
+							const event = JSON.parse(buffer);
+							if (event.type === "message_update") {
+								const delta = event.assistantMessageEvent;
+								if (delta?.type === "text_delta") textChunks.push(delta.delta || "");
 							}
-						} else if (event.type === "agent_end") {
-							const msgs = event.messages || [];
-							const last = [...msgs].reverse().find((m: any) => m.role === "assistant");
-							if (last?.usage && contextWindow > 0) {
-								state.contextPct = ((last.usage.input || 0) / contextWindow) * 100;
-								updateWidget();
-							}
-						}
-					} catch {}
-				}
-			});
+						} catch {}
+					}
+					resolveOne({ output: textChunks.join(""), exitCode: code ?? 1 });
+				});
 
-			proc.stderr!.setEncoding("utf-8");
-			proc.stderr!.on("data", () => {});
-
-			proc.on("close", (code) => {
-				if (buffer.trim()) {
-					try {
-						const event = JSON.parse(buffer);
-						if (event.type === "message_update") {
-							const delta = event.assistantMessageEvent;
-							if (delta?.type === "text_delta") textChunks.push(delta.delta || "");
-						}
-					} catch {}
-				}
-
-				clearInterval(state.timer);
-				state.elapsed = Date.now() - startTime;
-				state.status = code === 0 ? "done" : "error";
-
-				// Mark session file as available for resume
-				if (code === 0) {
-					state.sessionFile = agentSessionFile;
-				}
-
-				const full = textChunks.join("");
-				state.lastWork = full.split("\n").filter((l: string) => l.trim()).pop() || "";
-				updateWidget();
-
-				ctx.ui.notify(
-					`${displayName(state.def.name)} ${state.status} in ${Math.round(state.elapsed / 1000)}s`,
-					state.status === "done" ? "success" : "error"
-				);
-
-				resolve({
-					output: full,
-					exitCode: code ?? 1,
-					elapsed: state.elapsed,
+				proc.on("error", (err) => {
+					resolveOne({ output: `Error spawning agent: ${err.message}`, exitCode: 1 });
 				});
 			});
+		};
 
-			proc.on("error", (err) => {
-				clearInterval(state.timer);
-				state.status = "error";
-				state.lastWork = `Error: ${err.message}`;
-				updateWidget();
-				resolve({
-					output: `Error spawning agent: ${err.message}`,
-					exitCode: 1,
-					elapsed: Date.now() - startTime,
-				});
-			});
-		});
+		// Fan out across all resolved targets in parallel, then aggregate.
+		const results = await Promise.all(targets.map(t => runOne(t.spec, t.sessionFile)));
+
+		clearInterval(state.timer);
+		state.elapsed = Date.now() - startTime;
+		const anyOk = results.some(r => r.exitCode === 0);
+		state.status = anyOk ? "done" : "error";
+
+		// Mark the first successful target's session for resume + list display.
+		const firstOk = targets.find((_, i) => results[i].exitCode === 0);
+		if (firstOk) state.sessionFile = firstOk.sessionFile;
+
+		const isFanOut = state.def.models.length > 0;
+		let output: string;
+		if (isFanOut) {
+			const blocks = targets.map((t, i) =>
+				`=== [${t.label}] ${t.spec} (exit ${results[i].exitCode}) ===\n${results[i].output}`
+			);
+			if (unresolved.length > 0) {
+				blocks.push(`=== [unresolved] ${unresolved.join(", ")} ===\n(no matching codename in models.yaml)`);
+			}
+			output = blocks.join("\n\n");
+		} else {
+			output = results[0].output;
+		}
+
+		state.lastWork = output.split("\n").filter((l: string) => l.trim()).pop() || "";
+		updateWidget();
+
+		ctx.ui.notify(
+			`${displayName(state.def.name)} ${state.status} in ${Math.round(state.elapsed / 1000)}s`,
+			state.status === "done" ? "success" : "error"
+		);
+
+		return {
+			output,
+			exitCode: anyOk ? 0 : 1,
+			elapsed: state.elapsed,
+		};
 	}
 
 	// ── dispatch_agent Tool (registered at top level) ──

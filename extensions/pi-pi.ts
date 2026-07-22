@@ -20,8 +20,12 @@ import { Type } from "@sinclair/typebox";
 import { Text, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import { spawn } from "child_process";
 import { readdirSync, readFileSync, existsSync, mkdirSync } from "fs";
+import { homedir } from "os";
 import { join, resolve } from "path";
 import { applyExtensionDefaults } from "./themeMap.ts";
+
+// Global fallback home — lets pi-pi experts resolve from any directory
+const GLOBAL_PI_PI_DIR = join(homedir(), ".pi", "agent", "agents", "pi-pi");
 
 // ── Types ────────────────────────────────────────
 
@@ -102,8 +106,9 @@ export default function (pi: ExtensionAPI) {
 	let widgetCtx: any;
 
 	function loadExperts(cwd: string) {
-		// Pi Pi experts live in their own dedicated directory
-		const piPiDir = join(cwd, ".pi", "agents", "pi-pi");
+		// Pi Pi experts live in their own dedicated directory, falling back to the global home
+		const localPiPiDir = join(cwd, ".pi", "agents", "pi-pi");
+		const piPiDir = existsSync(localPiPiDir) ? localPiPiDir : GLOBAL_PI_PI_DIR;
 
 		experts.clear();
 
@@ -281,6 +286,7 @@ export default function (pi: ExtensionAPI) {
 			"-p",
 			"--no-session",
 			"--no-extensions",
+			"-e", "npm:claude-agent-sdk-pi",
 			"--model", model,
 			"--tools", state.def.tools,
 			"--thinking", "off",
@@ -561,7 +567,8 @@ Ask specific questions about what you need to BUILD. Each expert will return doc
 
 		const expertNames = Array.from(experts.values()).map(s => displayName(s.def.name)).join(", ");
 
-		const orchestratorPath = join(_ctx.cwd, ".pi", "agents", "pi-pi", "pi-orchestrator.md");
+		const localOrchestratorPath = join(_ctx.cwd, ".pi", "agents", "pi-pi", "pi-orchestrator.md");
+		const orchestratorPath = existsSync(localOrchestratorPath) ? localOrchestratorPath : join(GLOBAL_PI_PI_DIR, "pi-orchestrator.md");
 		let systemPrompt = "";
 		try {
 			const raw = readFileSync(orchestratorPath, "utf-8");

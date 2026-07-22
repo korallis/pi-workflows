@@ -1,0 +1,16 @@
+# Agent-team model routing.
+# Codename -> "<provider-slug>/<model-id>[:<thinking-level>]"
+#
+# Provider slugs are the LITERAL prefixes pi's --model expects
+# (from `pi --list-models`): claude-agent-sdk, moonshotai, openai-codex, xai.
+# These are NOT vendor names — Anthropic models use `claude-agent-sdk`, NOT
+# `anthropic`. --provider defaults to google, so the full provider/id in
+# --model is what routes correctly. Every value MUST contain a "/".
+# Re-point any role in one line here.
+
+models:
+  fast:      claude-agent-sdk/claude-haiku-4-5
+  reason:    claude-agent-sdk/claude-fable-5:high
+  sol:       openai-codex/gpt-5.6-sol:high
+  grok:      xai/grok-4.5:high
+  grok-fast: xai/grok-4.5
