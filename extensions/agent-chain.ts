@@ -50,6 +50,7 @@ interface AgentDef {
 	name: string;
 	description: string;
 	tools: string;
+	models: string[];
 	systemPrompt: string;
 }
 
@@ -152,10 +153,16 @@ function parseAgentFile(filePath: string): AgentDef | null {
 
 		if (!frontmatter.name) return null;
 
+		const models = (frontmatter.models || "")
+			.split(",")
+			.map(m => m.trim().replace(/^["']|["']$/g, "").trim())
+			.filter(Boolean);
+
 		return {
 			name: frontmatter.name,
 			description: frontmatter.description || "",
 			tools: frontmatter.tools || "read,grep,find,ls",
+			models,
 			systemPrompt: match[2].trim(),
 		};
 	} catch {
@@ -195,6 +202,32 @@ function scanAgentDirs(cwd: string): Map<string, AgentDef> {
 export default function (pi: ExtensionAPI) {
 	let allAgents: Map<string, AgentDef> = new Map();
 	let chains: ChainDef[] = [];
+	let modelMap: Record<string, string> = {};
+
+	function parseModelsYaml(raw: string): Record<string, string> {
+		const map: Record<string, string> = {};
+		let inModels = false;
+		for (const rawLine of raw.split("\n")) {
+			const line = rawLine.replace(/#.*$/, "");
+			if (!line.trim()) continue;
+			if (/^models:\s*$/.test(line)) {
+				inModels = true;
+				continue;
+			}
+			if (!/^\s/.test(line)) {
+				inModels = false;
+				continue;
+			}
+			if (!inModels) continue;
+			const idx = line.indexOf(":");
+			if (idx <= 0) continue;
+			const codename = line.slice(0, idx).trim();
+			const spec = line.slice(idx + 1).trim();
+			if (codename && spec && spec.includes("/")) map[codename] = spec;
+		}
+		return map;
+	}
+
 	let activeChain: ChainDef | null = null;
 	let widgetCtx: any;
 	let sessionDir = "";
@@ -228,6 +261,17 @@ export default function (pi: ExtensionAPI) {
 			}
 		} else {
 			chains = [];
+		}
+
+		const localModels = join(cwd, ".pi", "agents", "models.yaml");
+		const globalModels = join(GLOBAL_AGENTS_DIR, "models.yaml");
+		const modelsPath = existsSync(localModels) ? localModels : globalModels;
+		if (existsSync(modelsPath)) {
+			try {
+				modelMap = parseModelsYaml(readFileSync(modelsPath, "utf-8"));
+			} catch {
+				modelMap = {};
+			}
 		}
 	}
 
@@ -339,109 +383,144 @@ export default function (pi: ExtensionAPI) {
 		task: string,
 		stepIndex: number,
 		ctx: any,
-	): Promise<{ output: string; exitCode: number; elapsed: number }> {
-		const model = ctx.model
-			? `${ctx.model.provider}/${ctx.model.id}`
-			: "openrouter/google/gemini-3-flash-preview";
-
+	): Promise<{ output: string; exitCode: number; elapsed: number; forwardOutput: string }> {
 		const agentKey = agentDef.name.toLowerCase().replace(/\s+/g, "-");
-		const agentSessionFile = join(sessionDir, `chain-${agentKey}.json`);
-		const hasSession = agentSessions.get(agentKey);
-
-		const args = [
-			"--mode", "json",
-			"-p",
-			"--no-extensions",
-			"-e", "npm:claude-agent-sdk-pi",
-			"--model", model,
-			"--tools", agentDef.tools,
-			"--thinking", "off",
-			"--append-system-prompt", agentDef.systemPrompt,
-			"--session", agentSessionFile,
-		];
-
-		if (hasSession) {
-			args.push("-c");
-		}
-
-		args.push(task);
-
-		const textChunks: string[] = [];
-		const startTime = Date.now();
 		const state = stepStates[stepIndex];
+		const startTime = Date.now();
 
-		return new Promise((resolve) => {
-			const proc = spawn("pi", args, {
-				stdio: ["ignore", "pipe", "pipe"],
-				env: { ...process.env },
-			});
+		const runOne = (spec: string, sessionFile: string): Promise<{ output: string; exitCode: number }> => {
+			const hasSession = existsSync(sessionFile);
+			const slashIdx = spec.lastIndexOf("/");
+			const colonIdx = spec.lastIndexOf(":");
+			const hasThinkingSuffix = colonIdx > slashIdx;
 
-			const timer = setInterval(() => {
-				state.elapsed = Date.now() - startTime;
-				updateWidget();
-			}, 1000);
+			const args = [
+				"--mode", "json",
+				"-p",
+				"--no-extensions",
+				"-e", "npm:claude-agent-sdk-pi",
+				"--model", spec,
+				"--tools", agentDef.tools,
+				...(hasThinkingSuffix ? [] : ["--thinking", "off"]),
+				"--append-system-prompt", agentDef.systemPrompt,
+				"--session", sessionFile,
+			];
+			if (hasSession) args.push("-c");
+			args.push(task);
 
-			let buffer = "";
+			const textChunks: string[] = [];
 
-			proc.stdout!.setEncoding("utf-8");
-			proc.stdout!.on("data", (chunk: string) => {
-				buffer += chunk;
-				const lines = buffer.split("\n");
-				buffer = lines.pop() || "";
-				for (const line of lines) {
-					if (!line.trim()) continue;
-					try {
-						const event = JSON.parse(line);
-						if (event.type === "message_update") {
-							const delta = event.assistantMessageEvent;
-							if (delta?.type === "text_delta") {
-								textChunks.push(delta.delta || "");
-								const full = textChunks.join("");
-								const last = full.split("\n").filter((l: string) => l.trim()).pop() || "";
-								state.lastWork = last;
-								updateWidget();
+			return new Promise((resolveOne) => {
+				const proc = spawn("pi", args, {
+					stdio: ["ignore", "pipe", "pipe"],
+					env: { ...process.env },
+				});
+
+				let buffer = "";
+				proc.stdout!.setEncoding("utf-8");
+				proc.stdout!.on("data", (chunk: string) => {
+					buffer += chunk;
+					const lines = buffer.split("\n");
+					buffer = lines.pop() || "";
+					for (const line of lines) {
+						if (!line.trim()) continue;
+						try {
+							const event = JSON.parse(line);
+							if (event.type === "message_update") {
+								const delta = event.assistantMessageEvent;
+								if (delta?.type === "text_delta") {
+									textChunks.push(delta.delta || "");
+									const full = textChunks.join("");
+									const last = full.split("\n").filter((l: string) => l.trim()).pop() || "";
+									state.lastWork = last;
+									state.elapsed = Date.now() - startTime;
+									updateWidget();
+								}
 							}
-						}
-					} catch {}
-				}
-			});
+						} catch {}
+					}
+				});
 
-			proc.stderr!.setEncoding("utf-8");
-			proc.stderr!.on("data", () => {});
+				proc.stderr!.setEncoding("utf-8");
+				proc.stderr!.on("data", () => {});
 
-			proc.on("close", (code) => {
-				if (buffer.trim()) {
-					try {
-						const event = JSON.parse(buffer);
-						if (event.type === "message_update") {
-							const delta = event.assistantMessageEvent;
-							if (delta?.type === "text_delta") textChunks.push(delta.delta || "");
-						}
-					} catch {}
-				}
+				proc.on("close", (code) => {
+					if (buffer.trim()) {
+						try {
+							const event = JSON.parse(buffer);
+							if (event.type === "message_update") {
+								const delta = event.assistantMessageEvent;
+								if (delta?.type === "text_delta") textChunks.push(delta.delta || "");
+							}
+						} catch {}
+					}
+					const output = textChunks.join("");
+					if (code === 0) agentSessions.set(agentKey, sessionFile);
+					resolveOne({ output, exitCode: code ?? 1 });
+				});
 
-				clearInterval(timer);
-				const elapsed = Date.now() - startTime;
-				state.elapsed = elapsed;
-				const output = textChunks.join("");
-				state.lastWork = output.split("\n").filter((l: string) => l.trim()).pop() || "";
-
-				if (code === 0) {
-					agentSessions.set(agentKey, agentSessionFile);
-				}
-
-				resolve({ output, exitCode: code ?? 1, elapsed });
-			});
-
-			proc.on("error", (err) => {
-				clearInterval(timer);
-				resolve({
-					output: `Error spawning agent: ${err.message}`,
-					exitCode: 1,
-					elapsed: Date.now() - startTime,
+				proc.on("error", (err) => {
+					resolveOne({ output: `Error spawning agent: ${err.message}`, exitCode: 1 });
 				});
 			});
-		});
+		};
+
+		return (async () => {
+			const codenames = agentDef.models ?? [];
+			const isFanOut = codenames.length > 0;
+
+			if (!isFanOut) {
+				const model = ctx.model
+					? `${ctx.model.provider}/${ctx.model.id}`
+					: "openrouter/google/gemini-3-flash-preview";
+				const sessionFile = join(sessionDir, `chain-${agentKey}.json`);
+				const r = await runOne(model, sessionFile);
+				const elapsed = Date.now() - startTime;
+				state.elapsed = elapsed;
+				state.lastWork = r.output.split("\n").filter((l: string) => l.trim()).pop() || "";
+				return { output: r.output, exitCode: r.exitCode, elapsed, forwardOutput: r.output };
+			}
+
+			const targets: { label: string; spec: string; sessionFile: string }[] = [];
+			const unresolved: string[] = [];
+			for (const codename of codenames) {
+				const spec = modelMap[codename];
+				if (!spec) { unresolved.push(codename); continue; }
+				targets.push({ label: codename, spec, sessionFile: join(sessionDir, `chain-${agentKey}__${codename}.json`) });
+			}
+
+			if (targets.length === 0) {
+				const elapsed = Date.now() - startTime;
+				state.elapsed = elapsed;
+				return {
+					output: `Agent "${agentDef.name}" has no resolvable models. Unknown codenames: ${unresolved.join(", ")}. Check .pi/agents/models.yaml.`,
+					exitCode: 1,
+					elapsed,
+					forwardOutput: "",
+				};
+			}
+
+			const results = await Promise.all(targets.map(t => runOne(t.spec, t.sessionFile)));
+
+			const blocks = targets.map((t, i) => {
+				const body = results[i].output.length > 6000
+					? results[i].output.slice(0, 6000) + "\n... [block truncated]"
+					: results[i].output;
+				return `=== [${t.label}] ${t.spec} (exit ${results[i].exitCode}) ===\n${body}`;
+			});
+			if (unresolved.length > 0) {
+				blocks.push(`=== [unresolved] ${unresolved.join(", ")} ===\n(no matching codename in models.yaml)`);
+			}
+
+			const anyOk = results.some(r => r.exitCode === 0);
+			const firstOk = results.find(r => r.exitCode === 0);
+			const forwardOutput = firstOk ? firstOk.output : results[0].output;
+			const elapsed = Date.now() - startTime;
+			state.elapsed = elapsed;
+			state.lastWork = forwardOutput.split("\n").filter((l: string) => l.trim()).pop() || "";
+
+			return { output: blocks.join("\n\n"), exitCode: anyOk ? 0 : 1, elapsed, forwardOutput };
+		})();
 	}
 
 	// ── Run Chain (sequential pipeline) ─────────
@@ -466,6 +545,7 @@ export default function (pi: ExtensionAPI) {
 		updateWidget();
 
 		let input = task;
+		let lastDisplayOutput = task;
 		const originalPrompt = task;
 
 		for (let i = 0; i < activeChain.steps.length; i++) {
@@ -504,10 +584,11 @@ export default function (pi: ExtensionAPI) {
 			stepStates[i].status = "done";
 			updateWidget();
 
-			input = result.output;
+			input = result.forwardOutput;
+			lastDisplayOutput = result.output;
 		}
 
-		return { output: input, success: true, elapsed: Date.now() - chainStart };
+		return { output: lastDisplayOutput, success: true, elapsed: Date.now() - chainStart };
 	}
 
 	// ── run_chain Tool ──────────────────────────
